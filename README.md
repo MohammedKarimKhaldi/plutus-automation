@@ -41,6 +41,7 @@ patterns, filters to investor roles only, ranks by seniority.
     export ROCKETREACH_PASSWORD="your_password"
     .venv/bin/python rocketreach_web.py --input <file>.xlsx            # real run
     .venv/bin/python rocketreach_web.py --input <file>.xlsx --headful  # watch + finish 2FA
+    .venv/bin/python rocketreach_web.py --input <file>.xlsx --timeout 300  # slower/new-device logins
     .venv/bin/python rocketreach_web.py --input <file>.xlsx --plan     # plan only, no login
 
 Logs into RocketReach, resolves each firm via the company search (domain,
@@ -49,7 +50,10 @@ applies the investor-title filter, then clicks "Get Contact Info" on the top
 role-ranked candidates to reveal and capture emails. `--headful` keeps the
 browser visible — **recommended, often required** because RocketReach sits
 behind a Cloudflare challenge that blocks headless/automated browsers and may
-occasionally ask for manual verification.
+occasionally ask for manual verification. Login waits up to `--timeout`
+seconds (default 180) per step, prints URL/title progress in headful mode,
+auto-clicks a Cloudflare checkbox, and warns if RocketReach emails you a
+verification code for a new device.
 
 > **Calibrating selectors after a RocketReach redesign:** RocketReach's page
 > markup is not a public, stable API. If the scraper stops finding data, run

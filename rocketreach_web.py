@@ -253,7 +253,49 @@ def reveal_email(page, card, headful):
     return ""
 
 
-def login(page, email, password, headful, timeout=120):
+def _page_summary(page):
+    try:
+        return clean_text(page.title()), page.url
+    except Exception:
+        return "", ""
+
+
+def _body_snippet(page, limit=300):
+    try:
+        return clean_text(page.locator("body").inner_text(timeout=3000))[:limit]
+    except Exception:
+        return ""
+
+
+def _click_turnstile(page):
+    """Click a Cloudflare Turnstile checkbox if one is present."""
+    try:
+        for frm in page.frames:
+            cb = frm.locator("input[type='checkbox']").first
+            if cb.count() > 0 and cb.is_visible():
+                cb.click(timeout=2000)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+OTP_SIGNS = ("verification code", "enter the code", "we've sent",
+             "check your email", "verify your identity", "one-time",
+             "security code")
+
+
+def _report_otp(page):
+    body = _body_snippet(page, 600).lower()
+    if any(k in body for k in OTP_SIGNS):
+        print("    -> RocketReach may have emailed you a verification code; "
+              "open the inbox of the account email and enter the code in the "
+              "browser window.")
+        return True
+    return False
+
+
+def login(page, email, password, headful, timeout=180):
     if not email or not password:
         raise RuntimeError("set ROCKETREACH_EMAIL/ROCKETREACH_PASSWORD "
                            "or pass --email/--password")
@@ -261,12 +303,20 @@ def login(page, email, password, headful, timeout=120):
     # Wait out any Cloudflare "Just a moment" challenge before the form shows.
     em = page.locator(SEL["login_email"]).first
     deadline = time.time() + timeout
+    last_report = 0.0
     while time.time() < deadline:
         try:
             if em.count() > 0 and em.is_visible():
                 break
         except Exception:
             pass
+        _click_turnstile(page)
+        now = time.time()
+        if headful and now - last_report >= 15:
+            last_report = now
+            title, url = _page_summary(page)
+            print(f"    waiting for the login form to load… "
+                  f"(url: {url}, title: {title or '?'})")
         time.sleep(1.0)
     em.fill(email)
     pw = page.locator(SEL["login_password"]).first
@@ -276,10 +326,14 @@ def login(page, email, password, headful, timeout=120):
     except Exception:
         pw.press("Enter")
     if headful:
-        # Give the user a chance to complete 2FA / CAPTCHA manually.
-        print("  headful mode: complete any 2FA/CAPTCHA manually…")
+        # Login usually continues automatically. Only intervene if a
+        # Cloudflare/CAPTCHA box or an emailed verification code appears.
+        print("  login in progress — if a Cloudflare/CAPTCHA box appears, "
+              "click it; if RocketReach emails you a verification code, "
+              "enter it. Otherwise this continues automatically…")
     marker = SEL["logged_in_marker"]
     deadline = time.time() + timeout
+    last_report = 0.0
     while time.time() < deadline:
         try:
             if page.locator(marker).first.count() > 0 and \
@@ -287,10 +341,23 @@ def login(page, email, password, headful, timeout=120):
                 return
         except Exception:
             pass
+        _click_turnstile(page)
+        now = time.time()
+        if headful and now - last_report >= 15:
+            last_report = now
+            title, url = _page_summary(page)
+            print(f"    still logging in… (url: {url}, title: {title or '?'})")
+            _report_otp(page)
         time.sleep(1.0)
-    raise RuntimeError("login did not complete (2FA/CAPTCHA, Cloudflare "
-                       "challenge, or wrong credentials); run with --headful "
-                       "to complete any verification manually")
+    title, url = _page_summary(page)
+    snippet = _body_snippet(page, 300) or "(page had no readable text)"
+    raise RuntimeError(
+        "login did not complete. Final state -> "
+        f"url: {url}, title: {title or '?'}, body: {snippet!r}. "
+        "This usually means a Cloudflare challenge, a verification-by-email "
+        "prompt, or wrong credentials. Run with --headful to solve any "
+        "CAPTCHA/OTP manually."
+    )
 
 
 def dump_selectors(email, password, headful):
@@ -383,7 +450,7 @@ def run(args):
         ctx = browser.new_context()
         page = ctx.new_page()
         print("logging in…")
-        login(page, email, password, args.headful)
+        login(page, email, password, args.headful, timeout=args.timeout)
         print("logged in")
         for i, firm in enumerate(firms, 1):
             label = firm["vc_name"] or firm["normalized_domain"]
@@ -435,6 +502,9 @@ def main():
                     help="seconds between requests")
     ap.add_argument("--headful", action="store_true",
                     help="show the browser (needed to complete 2FA/CAPTCHA)")
+    ap.add_argument("--timeout", type=int, default=180,
+                    help="seconds to wait for login/Cloudflare per step "
+                         "(default 180)")
     ap.add_argument("--plan", action="store_true",
                     help="print the plan and exit (no login/browser)")
     ap.add_argument("--dump-selectors", action="store_true",

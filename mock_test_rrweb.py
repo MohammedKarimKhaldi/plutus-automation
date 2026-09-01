@@ -106,6 +106,7 @@ class FakeArgs:
     delay = 0.0
     headful = False
     plan = False
+    timeout = 180
 
 
 rw.run(args=FakeArgs())
