@@ -34,6 +34,8 @@ PERSON_URL = "https://rocketreach.co/person"
 SCAN_PAGE_SIZE = 10
 MAX_SCAN_CARDS = 30
 DEFAULT_LOGIN_TIMEOUT = 15
+DEFAULT_REVEAL_TIMEOUT = 15.0
+REVEAL_POLL_INTERVAL = 0.5
 
 # Selectors are centralised here because RocketReach's DOM is not a public,
 # stable API. They were verified against the live site when this file was
@@ -135,7 +137,8 @@ def extract_card(page, card):
     }
 
 
-def enrich_firm(page, firm, headful, delay, debug=False):
+def enrich_firm(page, firm, headful, delay,
+                reveal_timeout=DEFAULT_REVEAL_TIMEOUT, debug=False):
     result_rows = []
     try:
         candidates, note = find_candidates(page, firm, headful, delay, debug=debug)
@@ -174,7 +177,7 @@ def enrich_firm(page, firm, headful, delay, debug=False):
         }
         if not email:
             revealed, reveal_note = reveal_candidate_email(
-                page, cand, headful, delay
+                page, cand, headful, delay, reveal_timeout
             )
             if revealed and EMAIL_RE.fullmatch(revealed):
                 row["primary_email"] = revealed
@@ -367,7 +370,8 @@ def _person_name_key(value):
     return " ".join(clean_text(value).casefold().split())
 
 
-def reveal_candidate_email(page, candidate, headful, delay):
+def reveal_candidate_email(page, candidate, headful, delay,
+                           reveal_timeout=DEFAULT_REVEAL_TIMEOUT):
     """Re-open and identity-check a candidate before spending a lookup."""
     profile_card_id = clean_text(candidate.get("profile_card_id"))
     result_url = clean_text(candidate.get("result_url"))
@@ -388,49 +392,83 @@ def reveal_candidate_email(page, candidate, headful, delay):
         return fresh["email"].lower(), ""
 
     email = reveal_email(
-        page, card, headful, profile_card_id=profile_card_id
+        page, card, headful, profile_card_id=profile_card_id,
+        reveal_timeout=reveal_timeout,
     )
     if email:
         return email, ""
     return "", "no email shown on RocketReach card"
 
 
-def reveal_email(page, card, headful, profile_card_id=""):
-    """Click 'Get Contact Info' on a card and return the revealed email."""
-    btn = None
+def _email_from_card(card):
+    """Read an email already rendered on one verified profile card."""
     try:
-        btn = card.locator(SEL["reveal_button"]).first
-        if btn.count() == 0:
-            btn = None
+        email_links = card.locator(
+            "a[data-testid='email-phone-text-desktop'], "
+            "a[data-testid='email-phone-text-mobile']"
+        )
+        count = email_links.count()
     except Exception:
-        btn = None
-    if btn is None:
+        return ""
+    for i in range(count):
+        link = email_links.nth(i)
         try:
-            btn = page.locator(SEL["reveal_button"]).first
-            if btn.count() == 0:
+            href = clean_text(link.get_attribute("href", timeout=1000))
+        except Exception:
+            href = ""
+        values = [_text(link)]
+        if href.lower().startswith("mailto:"):
+            values.append(href[7:].split("?", 1)[0])
+        for value in values:
+            value = clean_text(value).lower()
+            if EMAIL_RE.fullmatch(value):
+                return value
+    return ""
+
+
+def reveal_email(page, card, headful, profile_card_id="",
+                 reveal_timeout=DEFAULT_REVEAL_TIMEOUT,
+                 poll_interval=REVEAL_POLL_INTERVAL):
+    """Click once, then poll the same verified card for its email."""
+    timeout = max(float(reveal_timeout), 0.0)
+    interval = max(float(poll_interval), 0.01)
+    deadline = time.monotonic() + timeout
+    clicked = False
+
+    while True:
+        if profile_card_id:
+            card = _find_card_by_id(page, profile_card_id) or card
+
+        email = _email_from_card(card)
+        if email:
+            return email
+
+        if not clicked:
+            try:
+                btn = card.locator(SEL["reveal_button"]).first
+                if btn.count() == 0:
+                    btn = None
+            except Exception:
                 btn = None
-        except Exception:
-            btn = None
-    if btn is not None:
-        try:
-            btn.click(timeout=8000)
-            time.sleep(2.0)
-        except Exception:
-            pass
+            if btn is not None:
+                try:
+                    btn.click(timeout=8000)
+                    clicked = True
+                    if headful:
+                        print(f"      reveal clicked — waiting up to "
+                              f"{timeout:g}s for email…")
+                except Exception:
+                    pass
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(interval, remaining))
+
+    # One final read handles an email rendered at the timeout boundary.
     if profile_card_id:
         card = _find_card_by_id(page, profile_card_id) or card
-    # After reveal, the card gets an email link with data-testid.
-    try:
-        email_links = card.locator("a[data-testid='email-phone-text-desktop'], "
-                                   "a[data-testid='email-phone-text-mobile']")
-        n = email_links.count()
-        for i in range(n):
-            v = _text(email_links.nth(i))
-            if EMAIL_RE.fullmatch(v):
-                return v.lower()
-    except Exception:
-        pass
-    return ""
+    return _email_from_card(card)
 
 
 def _visible(locator):
@@ -756,10 +794,20 @@ def run(args):
     errors = []
     resume = bool(getattr(args, "resume", False))
     retry_no_match = bool(getattr(args, "retry_no_match", False))
+    retry_missing_emails = bool(
+        getattr(args, "retry_missing_emails", False)
+    )
+    retry_missing_keys = set()
     if resume and os.path.isfile(args.output):
         all_rows, no_matches, errors = _load_checkpoint(args.output)
         completed_rows = all_rows if retry_no_match else all_rows + no_matches
         completed = {_firm_key(row) for row in completed_rows}
+        if retry_missing_emails:
+            retry_missing_keys = {
+                _firm_key(row) for row in all_rows
+                if not clean_text(row.get("primary_email"))
+            }
+            completed.difference_update(retry_missing_keys)
         completed.discard("")
         print(f"resuming {len(completed)} completed firms from {args.output}")
     else:
@@ -815,7 +863,11 @@ def run(args):
                 errors = [row for row in errors if _firm_key(row) != firm_key]
                 try:
                     rows, status, note = enrich_firm(
-                        page, firm, args.headful, args.delay, debug=args.debug
+                        page, firm, args.headful, args.delay,
+                        reveal_timeout=getattr(
+                            args, "reveal_timeout", DEFAULT_REVEAL_TIMEOUT
+                        ),
+                        debug=args.debug,
                     )
                 except Exception as exc:
                     rows, status, note = [], "api_error", (
@@ -834,6 +886,25 @@ def run(args):
                     print(f"    checkpoint saved -> {args.output}")
                     continue
                 if status == "no_match":
+                    if firm_key in retry_missing_keys:
+                        note = ("missing-email retry found no candidates; "
+                                "prior contacts retained")
+                        errors.append({
+                            "vc_name": firm["vc_name"],
+                            "website": firm["website"],
+                            "normalized_firm_name": firm["normalized_firm_name"],
+                            "normalized_domain": firm["normalized_domain"],
+                            "lookup_status": "retryable_error", "notes": note,
+                            "attempted_at": time.strftime(
+                                "%Y-%m-%dT%H:%M:%S%z"
+                            ),
+                        })
+                        print(f"    ERROR: {note}")
+                        _write_checkpoint(
+                            args.output, all_rows, no_matches, errors
+                        )
+                        print(f"    checkpoint saved -> {args.output}")
+                        continue
                     no_matches.append({
                         "vc_name": firm["vc_name"], "website": firm["website"],
                         "normalized_domain": firm["normalized_domain"],
@@ -848,6 +919,16 @@ def run(args):
                     print(f"    {r['contact_priority']:<18} "
                           f"{r['first_name']} {r['last_name']} "
                           f"<{r['primary_email'] or '-'}>")
+                if firm_key in retry_missing_keys:
+                    all_rows = [
+                        row for row in all_rows
+                        if _firm_key(row) != firm_key
+                    ]
+                    no_matches = [
+                        row for row in no_matches
+                        if _firm_key(row) != firm_key
+                    ]
+                    retry_missing_keys.discard(firm_key)
                 all_rows.extend(rows)
                 completed.add(firm_key)
                 _write_checkpoint(args.output, all_rows, no_matches, errors)
@@ -875,6 +956,10 @@ def main():
     ap.add_argument("--password", default="")
     ap.add_argument("--delay", type=float, default=1.0,
                     help="seconds between requests")
+    ap.add_argument("--reveal-timeout", type=float,
+                    default=DEFAULT_REVEAL_TIMEOUT,
+                    help="seconds to poll a verified card after one reveal "
+                         f"click (default {DEFAULT_REVEAL_TIMEOUT:g})")
     ap.add_argument("--headful", action="store_true",
                     help="show the browser (needed to complete 2FA/CAPTCHA)")
     ap.add_argument("--plan", action="store_true",
@@ -891,6 +976,8 @@ def main():
                     help="load --output and skip firms already checkpointed")
     ap.add_argument("--retry-no-match", action="store_true",
                     help="with --resume, research previous no-match firms again")
+    ap.add_argument("--retry-missing-emails", action="store_true",
+                    help="with --resume, revisit firms with blank emails")
     ap.add_argument("--debug", action="store_true",
                     help="print per-card scan verdicts while searching firms")
     ap.add_argument("--dump-selectors", action="store_true",

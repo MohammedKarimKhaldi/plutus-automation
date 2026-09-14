@@ -108,7 +108,7 @@ def fake_find(page, firm, headful, delay, debug=False):
     return CANDIDATES.get(key, []), "no match"
 
 
-def fake_reveal_candidate(page, candidate, headful, delay):
+def fake_reveal_candidate(page, candidate, headful, delay, reveal_timeout):
     return REVEALS.get(candidate.get("name", ""), ""), ""
 
 
@@ -144,6 +144,7 @@ class FakeSyncPlaywright:
 
 
 real_reveal_candidate_email = rw.reveal_candidate_email
+real_reveal_email = rw.reveal_email
 rw.find_candidates = fake_find
 rw.reveal_candidate_email = fake_reveal_candidate
 rw.sync_playwright = lambda: FakeSyncPlaywright()
@@ -172,6 +173,8 @@ class FakeArgs:
     fresh_login = False
     resume = False
     retry_no_match = False
+    retry_missing_emails = False
+    reveal_timeout = 15.0
 
 
 rw.run(args=FakeArgs())
@@ -236,7 +239,7 @@ email, note = real_reveal_candidate_email(
     object(),
     {"profile_card_id": "42", "result_url": "https://example.test/results",
      "name": "Expected Person"},
-    False, 0,
+    False, 0, 15.0,
 )
 assert email == ""
 assert "identity changed" in note
@@ -248,10 +251,54 @@ email, note = real_reveal_candidate_email(
     object(),
     {"profile_card_id": "42", "result_url": "https://example.test/results",
      "name": "Expected Person"},
-    False, 0,
+    False, 0, 15.0,
 )
 assert email == "expected@example.com"
 assert note == ""
+
+# One reveal click can complete asynchronously. Poll the verified card until a
+# delayed email appears, without clicking again and consuming another lookup.
+class DelayedEmailLinks:
+    def __init__(self, state):
+        self.state = state
+
+    def count(self):
+        self.state["polls"] += 1
+        return int(self.state["polls"] >= 3)
+
+    def nth(self, _index):
+        return self
+
+    def inner_text(self, **_kwargs):
+        return "delayed@example.com"
+
+
+class RevealButton:
+    @property
+    def first(self):
+        return self
+
+    def count(self):
+        return 1
+
+    def click(self, **_kwargs):
+        delayed_state["clicks"] += 1
+
+
+class DelayedRevealCard:
+    def locator(self, selector):
+        if selector == rw.SEL["reveal_button"]:
+            return RevealButton()
+        return DelayedEmailLinks(delayed_state)
+
+
+delayed_state = {"clicks": 0, "polls": 0}
+assert real_reveal_email(
+    object(), DelayedRevealCard(), False,
+    reveal_timeout=0.2, poll_interval=0.01,
+) == "delayed@example.com"
+assert delayed_state["clicks"] == 1
+assert delayed_state["polls"] >= 3
 
 # A per-firm browser timeout is checkpointed as retryable while later firms
 # continue. A resume run skips completed firms and retries only that failure.
@@ -293,4 +340,22 @@ assert {row["vc_name"] for row in resumed_rows} == {
 }
 assert {row["vc_name"] for row in resumed_no_matches} == {"Gamma Ventures"}
 assert resumed_errors == []
+
+# A targeted resume can revisit only firms that previously had one or more
+# contacts without an email, while retaining fully completed firms/no-matches.
+missing_email_searches = []
+def missing_email_find(page, firm, headful, delay, debug=False):
+    missing_email_searches.append(firm["vc_name"])
+    return fake_find(page, firm, headful, delay, debug=debug)
+
+
+class MissingEmailArgs(FakeArgs):
+    output = "test_rr_out.xlsx"
+    resume = True
+    retry_missing_emails = True
+
+
+rw.find_candidates = missing_email_find
+rw.run(args=MissingEmailArgs())
+assert missing_email_searches == ["Acme Ventures"]
 print("ALL MOCK TESTS PASSED (rr web)")
