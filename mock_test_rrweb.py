@@ -108,10 +108,8 @@ def fake_find(page, firm, headful, delay, debug=False):
     return CANDIDATES.get(key, []), "no match"
 
 
-def fake_reveal(page, card, headful):
-    if card is None:
-        return ""
-    return REVEALS.get(card.get("name", ""), "")
+def fake_reveal_candidate(page, candidate, headful, delay):
+    return REVEALS.get(candidate.get("name", ""), ""), ""
 
 
 class FakeChromium:
@@ -145,8 +143,9 @@ class FakeSyncPlaywright:
         return FakeChromium()
 
 
+real_reveal_candidate_email = rw.reveal_candidate_email
 rw.find_candidates = fake_find
-rw.reveal_email = fake_reveal
+rw.reveal_candidate_email = fake_reveal_candidate
 rw.sync_playwright = lambda: FakeSyncPlaywright()
 
 
@@ -171,6 +170,8 @@ class FakeArgs:
     timeout = rw.DEFAULT_LOGIN_TIMEOUT
     session_file = ""
     fresh_login = False
+    resume = False
+    retry_no_match = False
 
 
 rw.run(args=FakeArgs())
@@ -193,4 +194,103 @@ assert len(out[out["vc_name"] == "Acme Ventures"]) <= 3
 assert not (out["last_name"].isin(["Analyst", "Ceo"])).any()
 assert (out["source"] == "rocketreach_web").all()
 assert out["confidence"].notna().all()
+
+# A Playwright locator that disappears during a RocketReach re-render must not
+# abort the whole batch.
+class TimedOutLocator:
+    def inner_text(self, **_kwargs):
+        raise TimeoutError("stale card")
+
+
+assert rw._text(TimedOutLocator()) == ""
+
+# Checkpoints preserve both successful and no-match firms and can be loaded by
+# a later --resume run without changing the contacts-sheet contract.
+checkpoint = "test_rr_checkpoint.xlsx"
+checkpoint_rows = out.to_dict("records")
+checkpoint_no_matches = nm.fillna("").to_dict("records")
+rw._write_checkpoint(checkpoint, checkpoint_rows, checkpoint_no_matches, [])
+loaded_rows, loaded_no_matches, loaded_errors = rw._load_checkpoint(checkpoint)
+assert len(loaded_rows) == len(checkpoint_rows)
+assert len(loaded_no_matches) == len(checkpoint_no_matches)
+assert loaded_errors == []
+assert list(pd.read_excel(checkpoint, sheet_name="contacts").columns) == rw.FINAL_COLS
+assert list(pd.read_excel(checkpoint, sheet_name="no_match_firms").columns) == [
+    "vc_name", "website", "normalized_domain", "lookup_status", "notes",
+]
+
+# Resume keys use normalized domain first and normalized firm name as a stable
+# fallback, so name-only inputs can also be skipped safely.
+assert rw._firm_key({"normalized_domain": "acme.vc"}) == "domain:acme.vc"
+assert rw._firm_key({"vc_name": "Beta Capital", "normalized_domain": ""}) == \
+    "name:beta"
+
+# A refreshed card must still belong to the expected person before a reveal
+# can consume a lookup credit or attach an email.
+reveal_calls = []
+rw._open_results = lambda page, url, delay: None
+rw._find_card_by_id = lambda page, profile_card_id: object()
+rw.extract_card = lambda page, card: {"name": "Different Person", "email": ""}
+rw.reveal_email = lambda *args, **kwargs: reveal_calls.append(True) or "wrong@example.com"
+email, note = real_reveal_candidate_email(
+    object(),
+    {"profile_card_id": "42", "result_url": "https://example.test/results",
+     "name": "Expected Person"},
+    False, 0,
+)
+assert email == ""
+assert "identity changed" in note
+assert reveal_calls == []
+
+rw.extract_card = lambda page, card: {"name": "Expected Person", "email": ""}
+rw.reveal_email = lambda *args, **kwargs: "expected@example.com"
+email, note = real_reveal_candidate_email(
+    object(),
+    {"profile_card_id": "42", "result_url": "https://example.test/results",
+     "name": "Expected Person"},
+    False, 0,
+)
+assert email == "expected@example.com"
+assert note == ""
+
+# A per-firm browser timeout is checkpointed as retryable while later firms
+# continue. A resume run skips completed firms and retries only that failure.
+def flaky_find(page, firm, headful, delay, debug=False):
+    if firm["vc_name"].startswith("Beta"):
+        raise TimeoutError("card re-rendered")
+    return fake_find(page, firm, headful, delay, debug=debug)
+
+
+class ResumeArgs(FakeArgs):
+    output = "test_rr_resume.xlsx"
+
+
+rw.find_candidates = flaky_find
+rw.reveal_candidate_email = fake_reveal_candidate
+rw.run(args=ResumeArgs())
+partial_rows, partial_no_matches, partial_errors = rw._load_checkpoint(
+    ResumeArgs.output
+)
+assert {row["vc_name"] for row in partial_rows} == {"Acme Ventures"}
+assert {row["vc_name"] for row in partial_no_matches} == {"Gamma Ventures"}
+assert {row["vc_name"] for row in partial_errors} == {"Beta Capital"}
+
+resumed_searches = []
+def resumed_find(page, firm, headful, delay, debug=False):
+    resumed_searches.append(firm["vc_name"])
+    return fake_find(page, firm, headful, delay, debug=debug)
+
+
+ResumeArgs.resume = True
+rw.find_candidates = resumed_find
+rw.run(args=ResumeArgs())
+resumed_rows, resumed_no_matches, resumed_errors = rw._load_checkpoint(
+    ResumeArgs.output
+)
+assert resumed_searches == ["Beta Capital"]
+assert {row["vc_name"] for row in resumed_rows} == {
+    "Acme Ventures", "Beta Capital",
+}
+assert {row["vc_name"] for row in resumed_no_matches} == {"Gamma Ventures"}
+assert resumed_errors == []
 print("ALL MOCK TESTS PASSED (rr web)")
