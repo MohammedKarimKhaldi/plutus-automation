@@ -358,4 +358,43 @@ class MissingEmailArgs(FakeArgs):
 rw.find_candidates = missing_email_find
 rw.run(args=MissingEmailArgs())
 assert missing_email_searches == ["Acme Ventures"]
+
+# RocketReach's account-wide daily search quota is fatal for the batch. The
+# current firm remains retryable, its checkpoint is saved, and later firms are
+# not searched or incorrectly recorded as no-match.
+limit_page = StatePage(
+    "https://rocketreach.co/person",
+    body="You've reached your daily search limit",
+)
+try:
+    rw._raise_if_daily_search_limit(limit_page)
+except rw.DailySearchLimitError:
+    pass
+else:
+    raise AssertionError("daily search limit page was not detected")
+
+limited_searches = []
+def limited_find(page, firm, headful, delay, debug=False):
+    limited_searches.append(firm["vc_name"])
+    if firm["vc_name"].startswith("Beta"):
+        raise rw.DailySearchLimitError(
+            "RocketReach daily search limit reached"
+        )
+    return fake_find(page, firm, headful, delay, debug=debug)
+
+
+class LimitArgs(FakeArgs):
+    output = "test_rr_limit.xlsx"
+
+
+rw.find_candidates = limited_find
+rw.run(args=LimitArgs())
+limit_rows, limit_no_matches, limit_errors = rw._load_checkpoint(
+    LimitArgs.output
+)
+assert limited_searches == ["Acme Ventures", "Beta Capital"]
+assert {row["vc_name"] for row in limit_rows} == {"Acme Ventures"}
+assert limit_no_matches == []
+assert {row["vc_name"] for row in limit_errors} == {"Beta Capital"}
+assert limit_errors[0]["lookup_status"] == "daily_search_limit"
 print("ALL MOCK TESTS PASSED (rr web)")

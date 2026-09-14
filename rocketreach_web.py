@@ -87,6 +87,16 @@ BAD_CREDENTIAL_SIGNS = (
     "incorrect email", "incorrect password", "invalid credentials",
     "email or password is incorrect", "wrong password",
 )
+DAILY_SEARCH_LIMIT_SIGNS = (
+    "you've reached your daily search limit",
+    "you have reached your daily search limit",
+    "daily search limit reached",
+    "reached your daily search limit",
+)
+
+
+class DailySearchLimitError(RuntimeError):
+    """Raised when RocketReach blocks further searches for the account."""
 
 
 def _text(el):
@@ -142,6 +152,8 @@ def enrich_firm(page, firm, headful, delay,
     result_rows = []
     try:
         candidates, note = find_candidates(page, firm, headful, delay, debug=debug)
+    except DailySearchLimitError:
+        raise
     except RuntimeError as e:
         return [], "api_error", str(e)
 
@@ -214,8 +226,10 @@ def _person_url_for_company(page, firm, headful, delay):
     query = firm["normalized_domain"] or firm["vc_name"]
     page.goto(f"{COMPANY_URL}?domain={urllib.parse.quote(query)}",
               wait_until="domcontentloaded")
+    _raise_if_daily_search_limit(page)
     for _ in range(8):
         time.sleep(delay + 2.0)
+        _raise_if_daily_search_limit(page)
         if pg_title_ok(page):
             break
     btn = page.locator(SEL["company_search_employees"]).first
@@ -223,8 +237,10 @@ def _person_url_for_company(page, firm, headful, delay):
         btn.wait_for(state="visible", timeout=45000)
         btn.click(timeout=10000)
     except Exception:
+        _raise_if_daily_search_limit(page)
         return None, "company not found on RocketReach"
     time.sleep(delay + 2.0)
+    _raise_if_daily_search_limit(page)
     return page.url, ""
 
 
@@ -261,8 +277,10 @@ def _advance_page_start(url, step):
 
 def _open_results(page, url, delay):
     page.goto(url, wait_until="domcontentloaded")
+    _raise_if_daily_search_limit(page)
     for _ in range(8):
         time.sleep(delay + 2.0)
+        _raise_if_daily_search_limit(page)
         if pg_title_ok(page):
             break
     try:
@@ -270,7 +288,7 @@ def _open_results(page, url, delay):
             state="visible", timeout=30000
         )
     except Exception:
-        pass
+        _raise_if_daily_search_limit(page)
 
 
 def find_candidates(page, firm, headful, delay, debug=False):
@@ -296,6 +314,7 @@ def find_candidates(page, firm, headful, delay, debug=False):
         cards = page.locator(SEL["result_card"])
         count = cards.count()
         if first_page and count == 0:
+            _raise_if_daily_search_limit(page)
             return [], "no people found for firm on RocketReach"
         first_page = False
 
@@ -490,6 +509,16 @@ def _body_text(page, limit=1200):
         return clean_text(page.locator("body").inner_text(timeout=3000))[:limit]
     except Exception:
         return ""
+
+
+def _raise_if_daily_search_limit(page):
+    """Stop before a quota page can be mistaken for an empty search."""
+    body = _body_text(page, limit=4000).casefold()
+    if any(sign in body for sign in DAILY_SEARCH_LIMIT_SIGNS):
+        raise DailySearchLimitError(
+            "RocketReach daily search limit reached; wait for the account "
+            "reset, then resume from the saved checkpoint"
+        )
 
 
 def _is_logged_in(page):
@@ -869,21 +898,28 @@ def run(args):
                         ),
                         debug=args.debug,
                     )
+                except DailySearchLimitError as exc:
+                    rows, status, note = [], "daily_search_limit", str(exc)
                 except Exception as exc:
                     rows, status, note = [], "api_error", (
                         f"{type(exc).__name__}: {exc}"
                     )
-                if status == "api_error":
+                if status in {"api_error", "daily_search_limit"}:
                     print(f"    ERROR: {note}")
                     errors.append({
                         "vc_name": firm["vc_name"], "website": firm["website"],
                         "normalized_firm_name": firm["normalized_firm_name"],
                         "normalized_domain": firm["normalized_domain"],
-                        "lookup_status": "retryable_error", "notes": note,
+                        "lookup_status": status if status == "daily_search_limit"
+                        else "retryable_error", "notes": note,
                         "attempted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                     })
                     _write_checkpoint(args.output, all_rows, no_matches, errors)
                     print(f"    checkpoint saved -> {args.output}")
+                    if status == "daily_search_limit":
+                        print("    stopping: no later firms were searched; "
+                              "run again with --resume after the limit resets")
+                        break
                     continue
                 if status == "no_match":
                     if firm_key in retry_missing_keys:
